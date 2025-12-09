@@ -1,82 +1,175 @@
-# Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+module "vpc" {
+  source = "./modules/vpc"
 
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "4.52.0"
+  project_name         = var.cluster_name
+  vpc_cidr_range       = var.vpc_cidr_range
+  subnet-azs           = var.subnet-azs
+  public_subnet_cidrs  = var.public_subnet_cidrs
+  private_subnet_cidrs = var.private_subnet_cidrs
+}
+
+
+locals {
+  name_prefix     = var.cluster_name
+  vpc_id          = module.vpc.vpc_id
+  public_subnets  = module.vpc.public_subnets
+  private_subnets = module.vpc.private_subnets
+}
+
+
+
+
+# --------------------------
+# IAM ROLE FOR EC2 (SSM + Parameter Store)
+# --------------------------
+
+data "aws_iam_policy_document" "ec2_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "3.4.3"
-    }
-  }
-  required_version = ">= 1.1.0"
-
-  cloud {
-    organization = "REPLACE_ME"
-
-    workspaces {
-      name = "gh-actions-demo"
-    }
   }
 }
 
-provider "aws" {
-  region = "us-west-2"
+resource "aws_iam_role" "ec2_ssm_role" {
+  name               = "${local.name_prefix}-ec2-ssm-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
 }
 
-resource "random_pet" "sg" {}
-
-data "aws_ami" "ubuntu" {
-  most_recent = true
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  owners = ["099720109477"] # Canonical
+resource "aws_iam_role_policy_attachment" "ssm_managed" {
+  role       = aws_iam_role.ec2_ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_instance" "web" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t2.micro"
-  vpc_security_group_ids = [aws_security_group.web-sg.id]
-
-  user_data = <<-EOF
-              #!/bin/bash
-              apt-get update
-              apt-get install -y apache2
-              sed -i -e 's/80/8080/' /etc/apache2/ports.conf
-              echo "Hello World" > /var/www/html/index.html
-              systemctl restart apache2
-              EOF
+resource "aws_iam_policy" "kubeadm_ssm" {
+  name = "${local.name_prefix}-ssm-policy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter", "ssm:PutParameter"]
+      Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/kubeadm/*"
+    }]
+  })
 }
 
-resource "aws_security_group" "web-sg" {
-  name = "${random_pet.sg.id}-sg"
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  // connectivity to ubuntu mirrors is required to run `apt-get update` and `apt-get install apache2`
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "aws_iam_role_policy_attachment" "attach_kubeadm_ssm" {
+  role       = aws_iam_role.ec2_ssm_role.name
+  policy_arn = aws_iam_policy.kubeadm_ssm.arn
 }
 
-output "web-address" {
-  value = "${aws_instance.web.public_dns}:8080"
+resource "aws_iam_instance_profile" "ec2_ssm_profile" {
+  name = "${local.name_prefix}-instance-profile"
+  role = aws_iam_role.ec2_ssm_role.name
 }
+
+
+
+
+# --------------------------
+# SECURITY-GROUP-MODULE
+# --------------------------
+
+module "security_group" {
+  source       = "./modules/securtiy-groups"
+  vpc_id       = module.vpc.vpc_id
+  vpc_cidr     = var.vpc_cidr_range
+  cluster_name = "kubeadm-cluster"
+
+
+}
+
+# --------------------------
+# CREATE ALL MASTERS
+# --------------------------
+
+module "masters" {
+  source = "./modules/ec2-instance"
+
+  for_each = { for i in range(var.masters_count) : i => i }
+
+  name          = "${local.name_prefix}-master-${each.key}"
+  ami           = var.ubuntu_ami
+  instance_type = var.master_instance_type
+  subnet_id     = module.vpc.public_subnets[each.key]
+
+  security_group_ids = [module.security_group.master_sg_id]
+  key_name           = var.ssh_key_name
+
+  role                 = "master"
+  index                = each.key
+  masters_count        = var.masters_count
+  cluster_name         = var.cluster_name
+  ssm_worker_param     = var.ssm_worker_param
+  ssm_cp_param         = var.ssm_cp_param
+  iam_instance_profile = aws_iam_instance_profile.ec2_ssm_profile.name
+
+  # control_plane_endpoint = module.haproxy.private_ip
+}
+
+# --------------------------
+# FORCE HAPROXY TO WAIT FOR ALL MASTERS
+# --------------------------
+
+resource "null_resource" "masters_ready" {
+  depends_on = [
+    module.masters
+  ]
+}
+
+# --------------------------
+# HAPROXY MODULE
+# --------------------------
+
+module "haproxy" {
+  source = "./modules/haproxy"
+
+  name          = "${local.name_prefix}-haproxy"
+  ami           = var.ubuntu_ami
+  instance_type = var.haproxy_instance_type
+  subnet_id     = module.vpc.public_subnets[0]
+
+  security_group_ids = [module.security_group.kube_api_lb_sg_id]
+  key_name           = var.ssh_key_name
+
+  master_private_ips   = [for k, m in module.masters : m.private_ip]
+  cluster_name         = var.cluster_name
+  iam_instance_profile = aws_iam_instance_profile.ec2_ssm_profile.name
+
+  depends_on = [null_resource.masters_ready]
+}
+
+# --------------------------
+# WORKER MODULES
+# --------------------------
+
+module "workers" {
+  source = "./modules/ec2-instance"
+
+  for_each = { for i in range(var.workers_count) : i => i }
+
+  name               = "${local.name_prefix}-worker-${each.key}"
+  ami                = var.ubuntu_ami
+  instance_type      = var.worker_instance_type
+  subnet_id          = module.vpc.public_subnets[each.key % length(module.vpc.public_subnets)]
+  security_group_ids = [module.security_group.worker_sg_id]
+  key_name           = var.ssh_key_name
+
+  role          = "worker"
+  index         = each.key
+  masters_count = var.masters_count
+  cluster_name  = var.cluster_name
+
+  ssm_worker_param     = var.ssm_worker_param
+  ssm_cp_param         = var.ssm_cp_param
+  iam_instance_profile = aws_iam_instance_profile.ec2_ssm_profile.name
+
+  depends_on = [
+    null_resource.masters_ready,
+    module.haproxy
+  ]
+}
+
+
